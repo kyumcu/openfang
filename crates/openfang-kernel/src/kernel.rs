@@ -3793,35 +3793,68 @@ impl OpenFangKernel {
             })?
         };
 
-        // If fallback models are configured, wrap in FallbackDriver
-        if !manifest.fallback_models.is_empty() {
-            // Primary driver uses the agent's own model name (already set in request)
-            let mut chain: Vec<(std::sync::Arc<dyn openfang_runtime::llm_driver::LlmDriver>, String)> =
-                vec![(primary.clone(), String::new())];
-            for fb in &manifest.fallback_models {
-                let config = DriverConfig {
-                    provider: fb.provider.clone(),
-                    api_key: fb
-                        .api_key_env
-                        .as_ref()
-                        .and_then(|env| std::env::var(env).ok()),
-                    base_url: fb
-                        .base_url
-                        .clone()
-                        .or_else(|| self.config.provider_urls.get(&fb.provider).cloned()),
-                };
-                match drivers::create_driver(&config) {
-                    Ok(d) => chain.push((d, fb.model.clone())),
-                    Err(e) => {
-                        warn!("Fallback driver '{}' failed to init: {e}", fb.provider);
-                    }
+        // Build fallback chain:
+        // 1) Agent primary
+        // 2) Agent fallback_models (in order)
+        // 3) System default model (last resort)
+        let mut chain: Vec<(std::sync::Arc<dyn openfang_runtime::llm_driver::LlmDriver>, String)> =
+            vec![(primary.clone(), String::new())];
+
+        for fb in &manifest.fallback_models {
+            let config = DriverConfig {
+                provider: fb.provider.clone(),
+                api_key: fb
+                    .api_key_env
+                    .as_ref()
+                    .and_then(|env| std::env::var(env).ok()),
+                base_url: fb
+                    .base_url
+                    .clone()
+                    .or_else(|| self.config.provider_urls.get(&fb.provider).cloned()),
+            };
+            match drivers::create_driver(&config) {
+                Ok(d) => chain.push((d, fb.model.clone())),
+                Err(e) => {
+                    warn!("Fallback driver '{}' failed to init: {e}", fb.provider);
                 }
             }
-            if chain.len() > 1 {
-                return Ok(Arc::new(
-                    openfang_runtime::drivers::fallback::FallbackDriver::with_models(chain),
-                ));
+        }
+
+        let system_default = &self.config.default_model;
+        let should_try_system_default = !system_default.provider.is_empty()
+            && !system_default.model.is_empty()
+            // Skip exact duplicate only when primary already uses system default driver/config.
+            && !(manifest.model.provider == system_default.provider
+                && manifest.model.model == system_default.model
+                && !has_custom_key
+                && !has_custom_url);
+
+        if should_try_system_default {
+            let config = DriverConfig {
+                provider: system_default.provider.clone(),
+                api_key: std::env::var(&system_default.api_key_env).ok(),
+                base_url: system_default.base_url.clone().or_else(|| {
+                    self.config
+                        .provider_urls
+                        .get(&system_default.provider)
+                        .cloned()
+                }),
+            };
+            match drivers::create_driver(&config) {
+                Ok(d) => chain.push((d, system_default.model.clone())),
+                Err(e) => {
+                    warn!(
+                        "System default fallback driver '{}' failed to init: {e}",
+                        system_default.provider
+                    );
+                }
             }
+        }
+
+        if chain.len() > 1 {
+            return Ok(Arc::new(
+                openfang_runtime::drivers::fallback::FallbackDriver::with_models(chain),
+            ));
         }
 
         Ok(primary)
