@@ -12,6 +12,7 @@ mod updater;
 
 use openfang_kernel::OpenFangKernel;
 use openfang_types::event::{EventPayload, LifecycleEvent, SystemEvent};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
@@ -30,6 +31,8 @@ pub struct KernelState {
 /// Entry point for the Tauri application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    load_openfang_env_files();
+
     // Init tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -208,4 +211,67 @@ pub fn run() {
     // App event loop has ended — shut down the embedded server + kernel
     info!("Tauri app closed, shutting down embedded server...");
     server_handle.shutdown();
+}
+
+/// Load `~/.openfang/.env` and `~/.openfang/secrets.env` into process env.
+///
+/// Existing process env vars take priority and are never overridden.
+fn load_openfang_env_files() {
+    load_env_file(home_dir().map(|h| h.join(".openfang").join(".env")));
+    load_env_file(home_dir().map(|h| h.join(".openfang").join("secrets.env")));
+}
+
+fn load_env_file(path: Option<PathBuf>) {
+    let Some(path) = path else {
+        return;
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = parse_env_line(trimmed) else {
+            continue;
+        };
+        if std::env::var(&key).is_ok() {
+            continue;
+        }
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+}
+
+fn parse_env_line(line: &str) -> Option<(String, String)> {
+    let eq_pos = line.find('=')?;
+    let key = line[..eq_pos].trim().to_string();
+    let mut value = line[eq_pos + 1..].trim().to_string();
+
+    if key.is_empty() {
+        return None;
+    }
+
+    if ((value.starts_with('"') && value.ends_with('"'))
+        || (value.starts_with('\'') && value.ends_with('\'')))
+        && value.len() >= 2
+    {
+        value = value[1..value.len() - 1].to_string();
+    }
+
+    Some((key, value))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("USERPROFILE").ok().map(PathBuf::from)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var("HOME").ok().map(PathBuf::from)
+    }
 }
